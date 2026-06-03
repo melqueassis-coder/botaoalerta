@@ -20,7 +20,7 @@ const io = new Server(server, {
 });
 
 // Estrutura para armazenar as salas ativas
-// roomCode -> { elderlySocketId, caregivers: Set(socketId), activeAlert: null }
+// roomCode -> { elderlySocketId, elderlyName, caregivers: Map(socketId -> name), activeAlert: null }
 const rooms = new Map();
 
 // Mapeamento de socketId -> roomCode para limpeza rápida na desconexão
@@ -41,12 +41,14 @@ io.on('connection', (socket) => {
   console.log(`Dispositivo conectado: ${socket.id}`);
 
   // 1. Registro do Idoso (Criação de Sala)
-  socket.on('create-room', () => {
+  socket.on('create-room', ({ name }) => {
     const code = generateRoomCode();
+    const elderlyName = name || 'Idoso';
     
     rooms.set(code, {
       elderlySocketId: socket.id,
-      caregivers: new Set(),
+      elderlyName: elderlyName,
+      caregivers: new Map(), // socketId -> name
       activeAlert: null
     });
 
@@ -55,12 +57,12 @@ io.on('connection', (socket) => {
     
     socket.join(code);
     
-    console.log(`Sala criada: ${code} pelo idoso: ${socket.id}`);
+    console.log(`Sala criada: ${code} pelo idoso: ${elderlyName} (${socket.id})`);
     socket.emit('room-created', { code });
   });
 
   // 2. Registro do Cuidador (Entrar na Sala do Idoso)
-  socket.on('join-room', ({ code }) => {
+  socket.on('join-room', ({ code, name }) => {
     const cleanCode = code.toString().trim().replace(/\s/g, '');
     const room = rooms.get(cleanCode);
 
@@ -70,21 +72,28 @@ io.on('connection', (socket) => {
       return;
     }
 
-    room.caregivers.add(socket.id);
+    const caregiverName = name || 'Cuidador';
+    socket.userName = caregiverName; // Armazena o nome no próprio socket
+    room.caregivers.set(socket.id, caregiverName);
+    
     socketToRoom.set(socket.id, cleanCode);
     socketRole.set(socket.id, 'caregiver');
     
     socket.join(cleanCode);
     
-    console.log(`Cuidador ${socket.id} entrou na sala: ${cleanCode}`);
+    console.log(`Cuidador ${caregiverName} (${socket.id}) entrou na sala: ${cleanCode}`);
     
     // Notifica o cuidador que o pareamento deu certo
-    socket.emit('joined-successfully', { code: cleanCode });
+    socket.emit('joined-successfully', { 
+      code: cleanCode,
+      elderlyName: room.elderlyName
+    });
     
     // Notifica todos na sala que um cuidador se conectou
     io.to(cleanCode).emit('caregiver-status', { 
       connected: true, 
-      count: room.caregivers.size 
+      count: room.caregivers.size,
+      caregiversList: Array.from(room.caregivers.values())
     });
 
     // Se houver um alerta ativo na sala, envia imediatamente para o novo cuidador
@@ -106,7 +115,8 @@ io.on('connection', (socket) => {
     const room = rooms.get(code);
     if (room) {
       const alertData = {
-        type, // 'ajuda' (amigável) ou 'socorro' (emergência)
+        type, // 'ajuda' ou 'socorro'
+        elderlyName: room.elderlyName, // Inclui o nome do idoso no payload do alerta
         timestamp: new Date().toISOString()
       };
       
@@ -114,7 +124,7 @@ io.on('connection', (socket) => {
       
       // Envia o alerta para todos na sala (incluindo o próprio idoso e todos os cuidadores)
       io.to(code).emit('receive-alert', alertData);
-      console.log(`Alerta de ${type} disparado na sala: ${code}`);
+      console.log(`Alerta de ${type} disparado na sala ${code} por ${room.elderlyName}`);
     }
   });
 
@@ -122,6 +132,20 @@ io.on('connection', (socket) => {
   socket.on('acknowledge-alert', () => {
     const code = socketToRoom.get(socket.id);
     const role = socketRole.get(socket.id);
+
+    // Se o próprio idoso cancelar, também limpa
+    if (role === 'elderly') {
+      const room = rooms.get(code);
+      if (room && room.activeAlert) {
+        room.activeAlert = null;
+        io.to(code).emit('alert-acknowledged', { 
+          by: 'elderly',
+          byName: room.elderlyName,
+          message: 'Cancelado pelo idoso.' 
+        });
+      }
+      return;
+    }
 
     if (!code || role !== 'caregiver') {
       socket.emit('alert-error', { message: 'Apenas cuidadores pareados podem confirmar alertas.' });
@@ -132,12 +156,15 @@ io.on('connection', (socket) => {
     if (room && room.activeAlert) {
       room.activeAlert = null; // Limpa o alerta ativo
       
-      // Notifica todos na sala que o alerta foi atendido
+      const caregiverName = room.caregivers.get(socket.id) || 'Cuidador';
+      
+      // Notifica todos na sala que o alerta foi atendido e quem atendeu
       io.to(code).emit('alert-acknowledged', { 
         by: socket.id,
-        message: 'Ajuda a caminho!' 
+        byName: caregiverName,
+        message: `${caregiverName} está a caminho!` 
       });
-      console.log(`Alerta confirmado pelo cuidador ${socket.id} na sala: ${code}`);
+      console.log(`Alerta confirmado pelo cuidador ${caregiverName} na sala: ${code}`);
     }
   });
 
@@ -163,12 +190,14 @@ io.on('connection', (socket) => {
           rooms.delete(code);
         } else if (role === 'caregiver') {
           // Se o cuidador desconectar, atualiza o status na sala
+          const name = room.caregivers.get(socket.id);
           room.caregivers.delete(socket.id);
-          console.log(`Cuidador desconectou da sala: ${code}. Cuidadores restantes: ${room.caregivers.size}`);
+          console.log(`Cuidador ${name} desconectou da sala: ${code}. Restantes: ${room.caregivers.size}`);
           
           io.to(code).emit('caregiver-status', { 
             connected: room.caregivers.size > 0, 
-            count: room.caregivers.size 
+            count: room.caregivers.size,
+            caregiversList: Array.from(room.caregivers.values())
           });
         }
       }
